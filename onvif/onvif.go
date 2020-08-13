@@ -3,20 +3,18 @@ package goonvif
 import (
 	"encoding/xml"
 	"fmt"
+	"github.com/beevik/etree"
+	auth "goonvif/digest"
+	"goonvif/onvif/Device"
+	"goonvif/onvif/discover"
+	"goonvif/onvif/networking"
+	"goonvif/onvif/soap"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
-	//"vms/logger"
-
-	"github.com/beevik/etree"
-	Device "goonvif/onvif/device"
-	"goonvif/onvif/discover"
-	"goonvif/onvif/networking"
-	"goonvif/onvif/soap"
 )
 
 // Xlmns xlmns
@@ -81,6 +79,7 @@ type device struct {
 
 	endpoints map[string]string
 	info      deviceInfo
+	transport *auth.DigestTransport
 }
 
 func (dev *device) GetServices() map[string]string {
@@ -119,7 +118,7 @@ func GetAvailableDevicesAtSpecificEthernetInterface(interfaceName string) ([]dev
 			if c < len(nvtDevices) {
 				continue
 			}
-			dev, err := NewDevice(strings.Split(xaddr, " ")[0])
+			dev, err := NewDevice(strings.Split(xaddr, " ")[0], nil)
 			if err != nil {
 				return nil, fmt.Errorf("error %s %s", xaddr, err)
 			}
@@ -147,7 +146,7 @@ func (dev *device) getSupportedServices(resp *http.Response) {
 }
 
 //NewDevice function construct a ONVIF Device entity
-func NewDevice(xaddr string) (*device, error) {
+func NewDevice(xaddr string, edition *string) (*device, error) {
 	dev := new(device)
 	dev.xaddr = xaddr
 	dev.endpoints = make(map[string]string)
@@ -156,11 +155,19 @@ func NewDevice(xaddr string) (*device, error) {
 	getCapabilities := Device.GetCapabilities{Category: "All"}
 
 	resp, err := dev.CallMethod(getCapabilities)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("camera is not available at %s or it does not support ONVIF services", xaddr)
-	}
 
-	dev.getSupportedServices(resp)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if edition != nil && *edition == "OnVif-ProfileS" {
+			dev.addEndpoint("Media", "http://"+xaddr+"/onvif/services")
+			dev.addEndpoint("PTZ", "http://"+xaddr+"/onvif/services")
+		} else {
+			dev.addEndpoint("Media", "http://"+xaddr+"/onvif/Media")
+			dev.addEndpoint("PTZ", "http://"+xaddr+"/onvif/PTZ")
+		}
+		//return nil, fmt.Errorf("camera is not available at %s or it does not support ONVIF services", xaddr)
+	} else {
+		dev.getSupportedServices(resp)
+	}
 	return dev, nil
 }
 
@@ -175,6 +182,10 @@ func (dev *device) addEndpoint(Key, Value string) {
 func (dev *device) Authenticate(username, password string) {
 	dev.login = username
 	dev.password = password
+	dev.transport = &auth.DigestTransport{
+		Password: password,
+		Username: username,
+	}
 }
 
 //GetEndpoint returns specific ONVIF service endpoint address
@@ -205,11 +216,11 @@ func (dev device) CallMethod(method interface{}) (*http.Response, error) {
 
 	var endpoint string
 	switch pkg {
-	case "device":
+	case "device", "Device":
 		pkg = "Device"
 	case "Event":
 	case "Imaging":
-	case "media":
+	case "media", "Media":
 		pkg = "Media"
 	case "PTZ":
 	default:
@@ -224,9 +235,9 @@ func (dev device) callMethod(endpoint string, method interface{}) (*http.Respons
 	/*
 		Converting <method> struct to xml string representation
 	*/
+
 	output, err := xml.MarshalIndent(method, "  ", "    ")
 	if err != nil {
-		log.Println("xml MarshalIndent Error", err.Error())
 		return nil, err
 	}
 
@@ -235,7 +246,6 @@ func (dev device) callMethod(endpoint string, method interface{}) (*http.Respons
 	*/
 	soap, err := buildMethodSOAP(output)
 	if err != nil {
-		log.Println("buildMethodSOAP Error->", err.Error())
 		return nil, err
 	}
 
@@ -243,12 +253,14 @@ func (dev device) callMethod(endpoint string, method interface{}) (*http.Respons
 		Adding namespaces and WS-Security headers
 	*/
 	soap.AddRootNamespaces(Xlmns)
-	if dev.login != "" && dev.password != "" {
-		soap.AddWSSecurity(dev.login, dev.password)
+	if dev.transport == nil {
+		if dev.login != "" && dev.password != "" {
+			soap.AddWSSecurity(dev.login, dev.password)
+		}
 	}
 
 	/*
 		Sending request and returns the response
 	*/
-	return networking.SendSoap(endpoint, soap.Bytes())
+	return networking.SendSoap(dev.transport, endpoint, soap.Bytes())
 }
